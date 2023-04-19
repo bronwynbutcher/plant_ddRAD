@@ -1,0 +1,292 @@
+---
+title: "Stacks_analysis"
+author: "Bronwyn"
+date: "2023-04-17"
+output: github_document
+---
+
+```{r, message=FALSE}
+library(tidyverse)
+library(dplyr)
+library(knitr)
+```
+
+# Download data
+
+```{bash, eval = FALSE}
+mkdir plant
+cd plant
+wget -q -c -O 13881_3270_187183_HTKYYBGXN_SK_CGATGT_R1.fastq.gz "http://cbsuapps.biohpc.cornell.edu/Sequencing/showseqfile.aspx?mode=http&cntrl=529380291&refid=1015923"
+```
+
+# Check quality of data
+
+First create a directory in the workdir of the machine that I reserved and copy the data from the home directory to the working directory
+
+```{bash, eval = FALSE}
+mkdir /workdir/bgb27
+cp /home/bgb27/plant/13881_3270_187183_HTKYYBGXN_SK_CGATGT_R1.fastq.gz /workdir/bgb27
+```
+
+We will use FastQC (<https://www.bioinformatics.babraham.ac.uk/projects/fastqc/>) to check the quality of the data. Check the website above for an overview of the output and what it means.
+
+```{bash, eval = FALSE}
+fastqc 13881_3270_187183_HTKYYBGXN_SK_CGATGT_R1.fastq.gz
+```
+
+The .html file is stored in the `results` folder.
+
+```
+Total Sequences 7668960 
+Sequences flagged as poor quality 0 
+Sequence length 68 
+%GC 44
+```
+
+Overall quality looks good.
+
+# Trim and filter the data
+
+```{bash, eval = FALSE}
+#first unzip the data
+gunzip 13881_3270_187183_HTKYYBGXN_SK_CGATGT_R1.fastq.gz
+
+##Trim 3' end of all reads to a length of 67 bp (FASTX Trimmer). Just removed 1 base. 
+ 
+fastx_trimmer -f 1 -l 67 -Q33 -i 13881_3270_187183_HTKYYBGXN_SK_CGATGT_R1.fastq -o plant_t.fastq & 
+
+##Eliminate sequences where there is a sinlge Phred score below 10 and then sequences where 5% of reads have a with Phred quality scores below 20 
+#100% of the bases in a sequence must have a score of higher than 10 for the sequence to be kept 
+fastq_quality_filter -q 10 -p 100 -Q33 -i plant_t.fastq -o plant_tf.fastq &
+
+#95% of the bases in a sequence must have a score of more than 20 for the sequence to be kept 
+fastq_quality_filter -q 20 -p 95 -Q33 -i plant_tf.fastq -o plant_tff.fastq & 
+
+```
+
+# Demultiplex data
+
+Using the process radtags function from STACKS. Information about process_radtags: <https://catchenlab.life.illinois.edu/stacks/comp/process_radtags.php>
+
+On the biohpc cluster first run the following lines to add STACKS 2 to the path.
+
+```{bash, eval = FALSE}
+# First specify the library path and path to stacks-2.59:
+
+export LD_LIBRARY_PATH=/usr/local/gcc-7.3.0/lib64:/usr/local/gcc-7.3.0/lib
+
+export PATH=/programs/stacks-2.59/bin:$PATH
+```
+
+Create an index file for the samples: tab delimited text file with barcode and adapter sequence. named `plant_index.txt`.
+
+    ATCACG  1
+    CGATGT  2
+    TTAGGC  3
+    TGACCA  4
+    ACAGTG  5
+    GCCAAT  6
+    CTTGA   7
+    TCACC   8
+    CTAGC   9
+    ACAAA   10
+    AGCCC   11
+    GTATT   12
+    CTGTA   13
+    AGCAT   14
+    ACTAT   15
+
+Run process radtags to demultiplex data
+
+```{bash, eval = FALSE}
+mkdir plantraw
+mv ./plant_tff.fastq ./plantraw/plant_tff.fastq
+mkdir demultfilter
+nohup process_radtags -p ./plantraw -b ./plant_index.txt -o ./demultfilter -e pstI -c -q -E phred33 --inline_null -i fastq --adapter_1 GATCGGAAGAGCACACGTCTGAACTCCAGTCACCGATGTATCTCGTATGCCGTCTTCTGCTTG --adapter_mm 1 --filter_illumina &
+```
+
+Look at how many reads are in each sample. This information can be found in the process_radtags log files, but instead of having to open each of these I just run the wordcount function in linux
+
+```{bash, eval = FALSE}
+wc -l *.fq
+```
+
+number of reads per sample ranges from 101,938 to 487,063 with a total number of reads = 4,089,412
+
+    5435366 total sequences
+          0 failed Illumina filtered reads (0.0%)
+      11425 reads contained adapter sequence (0.2%)
+    1218567 barcode not found drops (22.4%)
+          0 low quality read drops (0.0%)
+     115962 RAD cutsite not found drops (2.1%)
+    4089412 retained reads (75.2%)
+
+**Note: there are 22% of the reads where the barcode was not found???**
+
+# Align reads using Denovo pipeline
+
+-   information on STACKS can be found here: <http://catchenlab.life.illinois.edu/stacks/>
+
+-   explanation of how the denovo pipeline works to form stacks and loci and what the parameters mean: <http://catchenlab.life.illinois.edu/stacks/param_tut.php>
+
+-   see this paper for description of the pipeline we will use: Rochette, N., Catchen, J. Deriving genotypes from RAD-seq short-read data using Stacks. Nat Protoc 12, 2640--2659 (2017). <https://doi-org.proxy.library.cornell.edu/10.1038/nprot.2017.123>
+
+Usually we would run just a subset of the samples through this script, but since we only have 15 samples we will run this on all the samples.
+
+We will run denovo assembly several times to optimize parameters. Fix M = n, 1-9 (= the number of mismatches between 2 alleles in either a heterozygote (M) or in population (n)) and keep m = 3 (stack depth/number of identical reads required to initiate a new allele)
+
+First, create a plant_popmap.txt file: This file should be a tab delimited file listing your sample names and the population they belong to (usually just "1").
+
+    1   1
+    2   1
+    3   1
+    4   1
+    5   1
+    6   1
+    7   1
+    8   1
+    9   1
+    10  1
+    11  1
+    12  1
+    13  1
+    14  1
+    15  1
+
+Then prepare a script to run the samples through the denovo wrapper using different M and n parameters. (denovo.sh)
+
+```{bash, eval = FALSE}
+##Run 1
+mkdir denovo_run1
+denovo_map.pl --samples /workdir/bgb27/demultfilter --popmap /workdir/bgb27/plant_popmap.txt -m 3 -M 1 -n 1 -T 24 -o /workdir/bgb27/denovo_run1
+populations -P /workdir/bgb27/denovo_run1 -M /workdir/bgb27/plant_popmap.txt -t 24 -r 0.8
+
+# note -T or -t = # of threads/CPUs to use
+# for populations: -P = path to directory containing the Stacks files (output from the denovo run)
+#                  -M = path to the population map (in thsi case same as used in the denovo trial)
+#                  -r = minimum percentage of individuals in a population req to have a locus to process the locus
+
+##Run 2
+mkdir denovo_run2
+denovo_map.pl --samples /workdir/bgb27/demultfilter --popmap /workdir/bgb27/plant_popmap.txt -m 3 -M 2 -n 2 -T 24 -o /workdir/bgb27/denovo_run2
+populations -P /workdir/bgb27/denovo_run2 -M /workdir/bgb27/plant_popmap.txt -t 24 -r 0.8
+
+##Run 3
+mkdir denovo_run3
+denovo_map.pl --samples /workdir/bgb27/demultfilter --popmap /workdir/bgb27/plant_popmap.txt -m 3 -M 3 -n 3 -T 24 -o /workdir/bgb27/denovo_run3
+populations -P /workdir/bgb27/denovo_run3 -M /workdir/bgb27/plant_popmap.txt -t 24 -r 0.8
+
+##Run 4
+mkdir denovo_run4
+denovo_map.pl --samples /workdir/bgb27/demultfilter --popmap /workdir/bgb27/plant_popmap.txt -m 3 -M 4 -n 4 -T 24 -o /workdir/bgb27/denovo_run4
+populations -P /workdir/bgb27/denovo_run4 -M /workdir/bgb27/plant_popmap.txt -t 24 -r 0.8
+
+##Run 5
+mkdir denovo_run5
+denovo_map.pl --samples /workdir/bgb27/demultfilter --popmap /workdir/bgb27/plant_popmap.txt -m 3 -M 5 -n 5 -T 24 -o /workdir/bgb27/denovo_run5
+populations -P /workdir/bgb27/denovo_run5 -M /workdir/bgb27/plant_popmap.txt -t 24 -r 0.8
+
+##Run 6
+mkdir denovo_run6
+denovo_map.pl --samples /workdir/bgb27/demultfilter --popmap /workdir/bgb27/plant_popmap.txt -m 3 -M 6 -n 6 -T 24 -o /workdir/bgb27/denovo_run6
+populations -P /workdir/bgb27/denovo_run6 -M /workdir/bgb27/plant_popmap.txt -t 24 -r 0.8
+
+##Run 7
+mkdir denovo_run7
+denovo_map.pl --samples /workdir/bgb27/demultfilter --popmap /workdir/bgb27/plant_popmap.txt -m 3 -M 7 -n 7 -T 24 -o /workdir/bgb27/denovo_run7
+populations -P /workdir/bgb27/denovo_run7 -M /workdir/bgb27/plant_popmap.txt -t 24 -r 0.8
+
+##Run 8
+mkdir denovo_run8
+denovo_map.pl --samples /workdir/bgb27/demultfilter --popmap /workdir/bgb27/plant_popmap.txt -m 3 -M 8 -n 8 -T 24 -o /workdir/bgb27/denovo_run8
+populations -P /workdir/bgb27/denovo_run8 -M /workdir/bgb27/plant_popmap.txt -t 24 -r 0.8
+
+##Run 9
+mkdir denovo_run9
+denovo_map.pl --samples /workdir/bgb27/demultfilter --popmap /workdir/bgb27/plant_popmap.txt -m 3 -M 9 -n 9 -T 24 -o /workdir/bgb27/denovo_run9
+populations -P /workdir/bgb27/denovo_run9 -M /workdir/bgb27/plant_popmap.txt -t 24 -r 0.8
+```
+
+run the script
+
+```{bash, eval = FALSE}
+nohup bash denovo.sh &
+```
+
+```{r, message=FALSE}
+read_tsv("./results/denovo_parameter_testing", col_types = "iiiiii") %>% 
+  kable()
+```
+
+plot the number of variants for each M/n parameter:
+
+```{r}
+read_tsv("./results/denovo_parameter_testing", col_types = "iiiiii") %>% 
+ggplot(mapping = aes(x = `M/n`, y = `variant`)) +
+  geom_point() +
+  geom_line() +
+  xlim (0,10)
+         
+```
+
+Based on this plot, I will select the M/n value of 8 and take a look at that. This time re-run populations with a minium minor allele frequency filter of 0.05 and only output one SNP (the first one) from each loci (see number of SNPs when these filters are applied to all denovo runs added in the table above). Also I'll output the data in some other formats (structure, vcf)
+
+```{bash, eval = FALSE}
+populations -P /workdir/bgb27/denovo_run8 -M /workdir/bgb27/plant_popmap.txt -r 0.80 -p 1 -t 15 --min-maf 0.05 --write-single-snp --structure --vcf
+```
+
+copy the populations.structure file to my computer and take a look at the data
+
+```{r, message = FALSE}
+read_tsv("./results/populations.structure", skip = 1) %>% 
+  rename(sample_ID = ...1, population = ...2) %>% 
+  kable()
+```
+
+Look at missing loci - these are loci where there is a 0
+
+```{r, message = FALSE}
+SNP_80_all <- read_tsv("./results/populations.structure", skip = 1) %>% 
+  rename(sample_ID = ...1, population = ...2) %>% 
+  rownames_to_column() %>%
+pivot_longer(
+  cols = -rowname) %>%
+pivot_wider(
+  names_from = rowname)
+
+missing <- colSums(SNP_80_all==0)
+
+rbind(SNP_80_all,missing) %>% 
+  filter(name == "sample_ID" | name == "0") %>% 
+  kable()
+```
+
+There are 3 samples that have a lot of missing data. (out of 829 loci)
+
+| Sample ID | missing_loci | percent_missing |
+|-----------|--------------|-----------------|
+| 2         | 822          | 99.16           |
+| 6         | 802          | 96.74           |
+| 7         | 510          | 61.52           |
+
+**I am confused as to why these samples have so much missing data? They are not the samples with the lowest # of reads?**
+
+Remove these samples from the popmap file (new file named `plant_popmap_12_samples`) and rerun populations.
+
+```{bash, eval = FALSE}
+populations -P /workdir/bgb27/denovo_run8 -M /workdir/bgb27/plant_popmap_12_samples.txt -r 0.80 -p 1 -t 15 --min-maf 0.05 --write-single-snp --structure --vcf
+```
+
+Removing the samples with lots of missing data has increased the number of loci that we have: Now we keep 7145 loci with 1193 polymorphic sites.
+
+Run vcftools relatedness on the vcf file output from populations. There are two options:
+
+--relatedness This option is used to calculate and output a relatedness statistic based on the method of Yang et al, Nature Genetics 2010 (doi:10.1038/ng.608). Specifically, calculate the unadjusted Ajk statistic. Expectation of Ajk is zero for individuals within a populations, and one for an individual with themselves. The output file has the suffix ".relatedness". **I have read that this is not ideal for small sample sizes...**
+
+--relatedness2 This option is used to calculate and output a relatedness statistic based on the method of Manichaikul et al., BIOINFORMATICS 2010 (doi:10.1093/bioinformatics/btq559). The output file has the suffix ".relatedness2".
+
+```{bash, eval = FALSE}
+vcftools --vcf populations12samples.snps.vcf --relatedness --out plant
+
+vcftools --vcf populations12samples.snps.vcf --relatedness2 --out plant
+```

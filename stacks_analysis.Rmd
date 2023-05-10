@@ -2,7 +2,7 @@
 title: "Stacks_analysis"
 author: "Bronwyn"
 date: "2023-04-17"
-output: github_document
+output: html_document
 ---
 
 ```{r, message=FALSE}
